@@ -7,23 +7,26 @@
 
 module Main(main) where
 
-import Data.Time.Clock (UTCTime)
 import Linker (initDynLinker)
 import Data.IORef
 import NameCache
 import Packages
 import Module
 import Arguments
-import Data.Maybe
-import Data.List.Extra
-import Data.Function
-import System.FilePath
+import Control.Concurrent.Async
 import Control.Concurrent.Extra
 import Control.Exception
 import Control.Monad.Extra
 import Control.Monad.IO.Class
 import Data.Default
-import System.Time.Extra
+import Data.Either
+import Data.Function
+import Data.List.Extra
+import Data.Maybe
+import qualified Data.Text as T
+import qualified Data.Text.IO as T
+import Data.Time.Clock (UTCTime)
+import Data.Version
 import Development.IDE.Core.Debouncer
 import Development.IDE.Core.FileStore
 import Development.IDE.Core.OfInterest
@@ -40,42 +43,36 @@ import Development.IDE.GHC.Util
 import Development.IDE.Plugin
 import Development.IDE.Plugin.Completions as Completions
 import Development.IDE.Plugin.CodeAction as CodeAction
-import qualified Data.Text as T
-import qualified Data.Text.IO as T
 import qualified Language.Haskell.LSP.Core as LSP
 import Language.Haskell.LSP.Messages
 import Language.Haskell.LSP.Types (LspId(IdInt))
-import Data.Version
 import Development.IDE.LSP.LanguageServer
 import qualified System.Directory.Extra as IO
 import System.Environment
 import System.IO
 import System.Exit
+import System.FilePath
+import System.Directory
+import System.Time.Extra
 import HIE.Bios.Environment (addCmdOpts)
 import Paths_ghcide
 import Development.GitRev
-import Development.Shake (Action,  action)
+import Development.Shake (Action, action)
 import qualified Data.HashSet as HashSet
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map.Strict as Map
-import Data.Either
-import qualified Crypto.Hash.SHA1               as H
-import qualified Data.ByteString.Char8          as B
-import Data.ByteString.Base16         (encode)
-import Control.Concurrent.Async
-
-import           DynFlags                       (gopt_set, gopt_unset,
-                                                 updOptLevel)
-
+import qualified Crypto.Hash.SHA1 as H
+import qualified Data.ByteString.Char8 as B
+import Data.ByteString.Base16 (encode)
+import DynFlags (gopt_set, gopt_unset, updOptLevel)
 import GhcMonad
 import HscTypes (HscEnv(..), ic_dflags)
 import DynFlags (PackageFlag(..), PackageArg(..))
 import GHC hiding (def)
-import           GHC.Check                      ( VersionCheck(..), makeGhcVersionChecker )
+import GHC.Check ( VersionCheck(..), makeGhcVersionChecker )
 
-import           HIE.Bios.Cradle
-import           HIE.Bios.Types
-import System.Directory
+import HIE.Bios.Cradle
+import HIE.Bios.Types
 
 import Utils
 
@@ -225,8 +222,8 @@ targetToFile _ (TargetFile f _) = do
 setNameCache :: IORef NameCache -> HscEnv -> HscEnv
 setNameCache nc hsc = hsc { hsc_NC = nc }
 
--- This is the key function which implements multi-component support. All
--- components mapping to the same hie,yaml file are mapped to the same
+-- | This is the key function which implements multi-component support. All
+-- components mapping to the same hie.yaml file are mapped to the same
 -- HscEnv which is updated as new components are discovered.
 loadSession :: FilePath -> Action (FilePath -> Action (IdeResult HscEnvEq))
 loadSession dir = do
@@ -327,7 +324,7 @@ loadSession dir = do
 
           -- New HscEnv for the component in question, returns the new HscEnvEq and
           -- a mapping from FilePath to the newly created HscEnvEq.
-          let new_cache = newCache logger hscEnv uids
+          let new_cache = newComponentCache logger hscEnv uids
           (cs, res) <- new_cache new
           -- Modified cache targets for everything else in the hie.yaml file
           -- which now uses the same EPS and so on
@@ -342,7 +339,7 @@ loadSession dir = do
            logInfo logger $ T.pack ("Consulting the cradle for " <> show cfp)
            cradle <- maybe (loadImplicitCradle $ addTrailingPathSeparator dir) loadCradle hieYaml
            eopts <- cradleToSessionOpts cradle cfp
-           print eopts
+           logDebug logger $ T.pack ("Session loading result: " <> show eopts)
            case eopts of
              -- The cradle gave us some options so get to work turning them
              -- into and HscEnv.
@@ -404,12 +401,13 @@ loadSession dir = do
 
 
 -- | Create a mapping from FilePaths to HscEnvEqs
-newCache :: Logger
+newComponentCache
+         :: Logger
          -> HscEnv
          -> [(InstalledUnitId, DynFlags)]
          -> ComponentInfo
          -> IO ([(NormalizedFilePath, (IdeResult HscEnvEq, DependencyInfo))], (IdeResult HscEnvEq, DependencyInfo))
-newCache logger hsc_env uids ci =  do
+newComponentCache logger hsc_env uids ci = do
     let df = componentDynFlags ci
     let hscEnv' = hsc_env { hsc_dflags = df
                           , hsc_IC = (hsc_IC hsc_env) { ic_dflags = df } }
@@ -419,13 +417,15 @@ newCache logger hsc_env uids ci =  do
               Just mismatch -> return mismatch
               Nothing -> newHscEnvEq hscEnv' uids
     let res = (([], Just henv), componentDependencyInfo ci)
-    liftIO $ logDebug logger (T.pack (show res))
+    liftIO $ logDebug logger ("New Component Cache HscEnvEq: " <> T.pack (show res))
 
     let is = importPaths df
     ctargets <- concatMapM (targetToFile is  . targetId) (componentTargets ci)
     -- A special target for the file which caused this wonderful
     -- component to be created. In case the cradle doesn't list all the targets for
     -- the component, in which case things will be horribly broken anyway.
+    -- Otherwise, we will immediately attempt to reload this module which
+    -- causes an infinite loop and high CPU usage.
     let special_target = (componentFP ci, res)
     let xs = map (,res) ctargets
     return (special_target:xs, res)
@@ -482,7 +482,9 @@ E.g. when you load two executables, they can not depend on each other. They
 should be filtered out, such that we dont have to re-compile everything.
 -}
 
-
+-- | Set the cache-directory based on the ComponentOptions and a list of
+-- internal packages.
+-- For the exact reason, see Note [Avoiding bad interface files].
 setCacheDir :: MonadIO m => String -> [String] -> ComponentOptions -> DynFlags -> m DynFlags
 setCacheDir prefix hscComponents comps dflags = do
     cacheDir <- liftIO $ getCacheDir prefix (hscComponents ++ componentOptions comps)
@@ -495,38 +497,65 @@ renderCradleError :: NormalizedFilePath -> CradleError -> FileDiagnostic
 renderCradleError nfp (CradleError _ec t) =
   ideErrorText nfp (T.unlines (map T.pack t))
 
-
-
+-- See Note [Multi Cradle Dependency Info]
 type DependencyInfo = Map.Map FilePath (Maybe UTCTime)
 type HieMap = Map.Map (Maybe FilePath) (HscEnv, [RawComponentInfo])
 type FlagsMap = Map.Map (Maybe FilePath) (HM.HashMap NormalizedFilePath (IdeResult HscEnvEq, DependencyInfo))
 
 -- This is pristine information about a component
-data RawComponentInfo = RawComponentInfo { rawComponentUnitId :: InstalledUnitId
-                                   , rawComponentDynFlags :: DynFlags
-                                   , rawComponentTargets :: [Target]
-                                   , rawComponentFP :: NormalizedFilePath
-                                   , rawComponentCOptions :: ComponentOptions
-                                   , rawComponentDependencyInfo :: DependencyInfo }
+data RawComponentInfo = RawComponentInfo
+  { rawComponentUnitId :: InstalledUnitId
+  -- | Unprocessed DynFlags. Contains inplace packages such as libraries.
+  -- We do not want to use them unprocessed.
+  , rawComponentDynFlags :: DynFlags
+  -- | All targets of this components.
+  , rawComponentTargets :: [Target]
+  -- | Filepath which caused the creation of this component
+  , rawComponentFP :: NormalizedFilePath
+  -- | Component Options used to load the component.
+  , rawComponentCOptions :: ComponentOptions
+  -- | Maps cradle dependencies, such as `stack.yaml`, or `.cabal` file
+  -- to last modification time. See Note [Multi Cradle Dependency Info].
+  , rawComponentDependencyInfo :: DependencyInfo
+  }
 
 -- This is processed information about the component, in particular the dynflags will be modified.
-data ComponentInfo = ComponentInfo { componentUnitId :: InstalledUnitId
-                                   , componentDynFlags :: DynFlags
-                                   , componentInternalUnits :: [InstalledUnitId]
-                                   , componentTargets :: [Target]
-                                   , componentFP :: NormalizedFilePath
-                                   , componentCOptions :: ComponentOptions
-                                   , componentDependencyInfo :: DependencyInfo }
+data ComponentInfo = ComponentInfo
+  { componentUnitId :: InstalledUnitId
+  -- | Processed DynFlags. Does not contain inplace packages such as local
+  -- libraries. Can be used to actually load this Component.
+  , componentDynFlags :: DynFlags
+  -- | Internal units, such as local libraries, that this component
+  -- is loaded with. These have been extracted from the original
+  -- ComponentOptions.
+  , componentInternalUnits :: [InstalledUnitId]
+  -- | All targets of this components.
+  , componentTargets :: [Target]
+  -- | Filepath which caused the creation of this component
+  , componentFP :: NormalizedFilePath
+  -- | Component Options used to load the component.
+  , componentCOptions :: ComponentOptions
+  -- | Maps cradle dependencies, such as `stack.yaml`, or `.cabal` file
+  -- to last modification time. See Note [Multi Cradle Dependency Info]
+  , componentDependencyInfo :: DependencyInfo
+  }
 
+-- | Check if any dependency has been modified lately.
 checkDependencyInfo :: DependencyInfo -> IO Bool
 checkDependencyInfo old_di = do
   di <- getDependencyInfo (Map.keys old_di)
   return (di == old_di)
 
+-- Note [Multi Cradle Dependency Info]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- Why do we implement our own file modification tracking here?
 -- The primary reason is that the custom caching logic is quite complicated and going into shake
 -- adds even more complexity and more indirection. I did try for about 5 hours to work out how to
 -- use shake rules rather than IO but eventually gave up.
+
+-- | Computes a mapping from a filepath to its latest modification date.
+-- See Note [Multi Cradle Dependency Info] why we do this ourselves instead
+-- of letting shake take care of it.
 getDependencyInfo :: [FilePath] -> IO DependencyInfo
 getDependencyInfo fs = Map.fromList <$> mapM do_one fs
 
@@ -537,7 +566,7 @@ getDependencyInfo fs = Map.fromList <$> mapM do_one fs
     do_one :: FilePath -> IO (FilePath, Maybe UTCTime)
     do_one fp = (fp,) . either (const Nothing) Just <$> tryIO (getModificationTime fp)
 
--- This function removes all the -package flags which refer to packages we
+-- | This function removes all the -package flags which refer to packages we
 -- are going to deal with ourselves. For example, if a executable depends
 -- on a library component, then this function will remove the library flag
 -- from the package flags for the executable
@@ -618,7 +647,7 @@ getCacheDir prefix opts = IO.getXdgDirectory IO.XdgCache (cacheDir </> prefix ++
         -- GHC options will create incompatible interface files.
         opts_hash = B.unpack $ encode $ H.finalize $ H.updates H.init $ (map B.pack opts)
 
--- Prefix for the cache path
+-- | Sub directory for the cache path
 cacheDir :: String
 cacheDir = "ghcide"
 
